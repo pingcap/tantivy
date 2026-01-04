@@ -141,3 +141,5 @@ You can also find other bindings on [GitHub](https://github.com/search?q=tantivy
 ### When will my documents be searchable during indexing?
 
 - Documents will be searchable after a `commit` is called on an `IndexWriter`. Existing `IndexReader`s will also need to be reloaded in order to reflect the changes. Finally, changes are only visible to newly acquired `Searcher`.
+- 
+<!-- test -->
