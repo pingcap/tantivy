@@ -171,3 +171,7 @@ harness = false
 [[bench]]
 name = "range_queries"
 harness = false
+
+[[bench]]
+name = "tici_bool_queries"
+harness = false

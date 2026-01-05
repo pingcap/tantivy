@@ -87,6 +87,11 @@ pub trait DocSet: Send {
     /// length of the docset.
     fn size_hint(&self) -> u32;
 
+    /// Returns whether the docset is a range docset.
+    fn is_range(&self) -> bool {
+        false
+    }
+
     /// Returns the number documents matching.
     /// Calling this method consumes the `DocSet`.
     fn count(&mut self, alive_bitset: &AliveBitSet) -> u32 {
@@ -134,6 +139,10 @@ impl DocSet for &mut dyn DocSet {
         (**self).size_hint()
     }
 
+    fn is_range(&self) -> bool {
+        (**self).is_range()
+    }
+
     fn count(&mut self, alive_bitset: &AliveBitSet) -> u32 {
         (**self).count(alive_bitset)
     }
@@ -167,6 +176,11 @@ impl<TDocSet: DocSet + ?Sized> DocSet for Box<TDocSet> {
     fn size_hint(&self) -> u32 {
         let unboxed: &TDocSet = self.borrow();
         unboxed.size_hint()
+    }
+
+    fn is_range(&self) -> bool {
+        let unboxed: &TDocSet = self.borrow();
+        unboxed.is_range()
     }
 
     fn count(&mut self, alive_bitset: &AliveBitSet) -> u32 {
