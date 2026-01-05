@@ -167,3 +167,7 @@ harness = false
 [[bench]]
 name = "agg_bench"
 harness = false
+
+[[bench]]
+name = "range_queries"
+harness = false
