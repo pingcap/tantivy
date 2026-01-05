@@ -69,11 +69,16 @@ const DEFAULT_FETCH_HORIZON: u32 = 128;
 
 impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
     pub(crate) fn new(value_range: RangeInclusive<T>, column: Column<T>) -> Self {
+        let mut init_fetch_start: u32 = 0;
+        if *value_range.start() > column.max_value() || *value_range.end() < column.min_value() {
+            init_fetch_start = TERMINATED;
+        }
+
         Self {
             value_range,
             column,
             inner: RefCell::new(RangeDocSetInner {
-                next_fetch_start: 0,
+                next_fetch_start: init_fetch_start,
                 fetch_horizon: DEFAULT_FETCH_HORIZON,
                 loaded_docs: VecCursor::new(),
                 last_seek_pos_opt: None,
@@ -297,5 +302,53 @@ mod tests {
 
         let count = searcher.search(&query, &Count).unwrap();
         assert_eq!(count, 500);
+    }
+
+    #[test]
+    fn range_query_no_overlap_optimization() {
+        let mut schema_builder = schema::SchemaBuilder::new();
+        let id_field = schema_builder.add_text_field("id", schema::STRING);
+        let value_field = schema_builder.add_u64_field("value", schema::FAST | schema::INDEXED);
+
+        let dir = RamDirectory::default();
+        let index = IndexBuilder::new()
+            .schema(schema_builder.build())
+            .open_or_create(dir)
+            .unwrap();
+
+        {
+            let mut writer = index.writer(15_000_000).unwrap();
+
+            // Add documents with values in the range [10, 20]
+            for i in 0..100 {
+                let mut doc = TantivyDocument::new();
+                doc.add_text(id_field, format!("doc{i}"));
+                doc.add_u64(value_field, 10 + (i % 11) as u64); // values in range 10-20
+
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+
+        // Test a range query [100, 200] that has no overlap with data range [10, 20]
+        let query = RangeQuery::new(
+            Bound::Included(Term::from_field_u64(value_field, 100)),
+            Bound::Included(Term::from_field_u64(value_field, 200)),
+        );
+
+        let count = searcher.search(&query, &Count).unwrap();
+        assert_eq!(count, 0); // should return 0 results since there's no overlap
+
+        // Test another non-overlapping range: [0, 5] while data range is [10, 20]
+        let query2 = RangeQuery::new(
+            Bound::Included(Term::from_field_u64(value_field, 0)),
+            Bound::Included(Term::from_field_u64(value_field, 5)),
+        );
+
+        let count2 = searcher.search(&query2, &Count).unwrap();
+        assert_eq!(count2, 0); // should return 0 results since there's no overlap
     }
 }
