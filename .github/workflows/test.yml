@@ -2,9 +2,9 @@ name: Unit tests
 
 on:
   push:
-    branches: [ main ]
+    branches: [ release-0.25-tici ]
   pull_request:
-    branches: [ main ]
+    branches: [ release-0.25-tici ]
 
 env:
   CARGO_TERM_COLOR: always

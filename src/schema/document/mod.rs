@@ -46,7 +46,7 @@
 //!     // Tantivy provides trait implementations for common `serde_json` types.
 //!     fields: BTreeMap<Field, serde_json::Value>
 //! }
-//!
+//! #[allow(dead_code)]
 //! impl Document for MyCustomDocument {
 //!     // The value type produced by the `iter_fields_and_values` iterator.
 //!     // tantivy already implements the Value trait for serde_json::Value.
