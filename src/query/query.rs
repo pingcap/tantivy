@@ -140,9 +140,10 @@ pub trait Query: QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug {
     /// for the built-in support matrix and query-specific constraints.
     ///
     /// Every term reported as present by [`SingleDocument`](crate::query::SingleDocument) must have
-    /// a non-zero term frequency. Positions are required only by `PhraseQuery`; other supported
-    /// query types allow them to be omitted. When BM25 scoring is enabled for a `TermQuery` or
-    /// `PhraseQuery`, a fieldnorm is also required for fields configured with fieldnorms.
+    /// a non-zero term frequency. Positions are required by `PhraseQuery` and `PhrasePrefixQuery`;
+    /// other supported query types allow them to be omitted. When BM25 scoring is enabled for a
+    /// `TermQuery`, `PhraseQuery`, or `PhrasePrefixQuery`, a fieldnorm is also required for fields
+    /// configured with fieldnorms.
     ///
     /// Callers must also supply valid BM25 statistics and finite query scores or boosts when
     /// scoring is enabled. See the

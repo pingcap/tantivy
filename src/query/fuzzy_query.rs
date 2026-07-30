@@ -1,9 +1,16 @@
+use std::ops::Bound;
+
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA};
 use once_cell::sync::OnceCell;
 use tantivy_fst::Automaton;
 
-use crate::query::{AutomatonWeight, EnableScoring, Query, Weight};
-use crate::schema::{Term, Type};
+use crate::query::single_document::{effective_record_option, validate_term_info};
+use crate::query::{
+    AutomatonWeight, DocumentEvaluation, EnableScoring, Query, SingleDocument,
+    SingleDocumentEvaluationContext, SingleDocumentEvaluator, Weight,
+};
+use crate::schema::{Field, IndexRecordOption, Term, Type};
+use crate::Score;
 use crate::TantivyError::InvalidArgument;
 
 pub(crate) struct DfaWrapper(pub DFA);
@@ -109,7 +116,7 @@ impl FuzzyTermQuery {
         }
     }
 
-    fn specialized_weight(&self) -> crate::Result<AutomatonWeight<DfaWrapper>> {
+    fn specialized_automaton(&self) -> crate::Result<(DfaWrapper, Option<Box<[u8]>>)> {
         static AUTOMATON_BUILDER: [[OnceCell<LevenshteinAutomatonBuilder>; 2]; 3] = [
             [OnceCell::new(), OnceCell::new()],
             [OnceCell::new(), OnceCell::new()],
@@ -160,17 +167,22 @@ impl FuzzyTermQuery {
             automaton_builder.build_dfa(term_text)
         };
 
-        if let Some((json_path_bytes, _)) = term_value.as_json() {
+        let json_path = term_value
+            .as_json()
+            .map(|(json_path_bytes, _)| json_path_bytes.to_vec().into_boxed_slice());
+        Ok((DfaWrapper(automaton), json_path))
+    }
+
+    fn specialized_weight(&self) -> crate::Result<AutomatonWeight<DfaWrapper>> {
+        let (automaton, json_path) = self.specialized_automaton()?;
+        if let Some(json_path_bytes) = json_path {
             Ok(AutomatonWeight::new_for_json_path(
                 self.term.field(),
-                DfaWrapper(automaton),
-                json_path_bytes,
+                automaton,
+                &json_path_bytes,
             ))
         } else {
-            Ok(AutomatonWeight::new(
-                self.term.field(),
-                DfaWrapper(automaton),
-            ))
+            Ok(AutomatonWeight::new(self.term.field(), automaton))
         }
     }
 }
@@ -179,6 +191,82 @@ impl Query for FuzzyTermQuery {
     fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(self.specialized_weight()?))
     }
+
+    fn single_document_evaluator(
+        &self,
+        context: SingleDocumentEvaluationContext<'_>,
+    ) -> crate::Result<Box<dyn SingleDocumentEvaluator>> {
+        effective_record_option(context.schema(), &self.term, IndexRecordOption::Basic)?;
+        let (automaton, json_path) = self.specialized_automaton()?;
+        let score = if context.is_scoring_enabled() {
+            context.boost()
+        } else {
+            1.0
+        };
+        Ok(Box::new(FuzzySingleDocumentEvaluator {
+            field: self.term.field(),
+            automaton,
+            json_path,
+            score,
+        }))
+    }
+}
+
+struct FuzzySingleDocumentEvaluator {
+    field: Field,
+    automaton: DfaWrapper,
+    json_path: Option<Box<[u8]>>,
+    score: Score,
+}
+
+impl SingleDocumentEvaluator for FuzzySingleDocumentEvaluator {
+    fn evaluate_impl(
+        &mut self,
+        document: &dyn SingleDocument,
+    ) -> crate::Result<DocumentEvaluation> {
+        let mut result = Ok(DocumentEvaluation::NoMatch);
+        let mut visitor = |term: &Term, term_info: crate::query::SingleDocumentTermInfo<'_>| {
+            if matches!(result, Ok(DocumentEvaluation::Match(_)) | Err(_)) {
+                return false;
+            }
+            if let Some(expected_json_path) = &self.json_path {
+                let term_value = term.value();
+                let Some((candidate_json_path, _)) = term_value.as_json() else {
+                    return true;
+                };
+                if candidate_json_path != expected_json_path.as_ref() {
+                    return true;
+                }
+            }
+            if automaton_matches(&self.automaton, term.serialized_value_bytes()) {
+                result = validate_term_info(term, term_info.term_freq)
+                    .map(|()| DocumentEvaluation::Match(self.score));
+                return false;
+            }
+            true
+        };
+        document.visit_terms(
+            self.field,
+            (Bound::Unbounded, Bound::Unbounded),
+            &mut visitor,
+        );
+        result
+    }
+
+    fn required_fields(&self) -> Option<&[Field]> {
+        Some(std::slice::from_ref(&self.field))
+    }
+}
+
+fn automaton_matches<A: Automaton>(automaton: &A, bytes: &[u8]) -> bool {
+    let mut state = automaton.start();
+    for &byte in bytes {
+        state = automaton.accept(&state, byte);
+        if !automaton.can_match(&state) {
+            return false;
+        }
+    }
+    automaton.is_match(&state)
 }
 
 #[cfg(test)]

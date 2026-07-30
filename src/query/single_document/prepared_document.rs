@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::io;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use common::JsonPathWriter;
 use stacker::Addr;
 
-use super::{SingleDocument, SingleDocumentEvaluator, SingleDocumentTermInfo};
+use super::{SingleDocument, SingleDocumentTermInfo};
 use crate::fieldnorm::FieldNormReader;
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::indexer::document_indexer::{
@@ -37,28 +38,20 @@ pub struct SingleDocumentPreparer {
 }
 
 impl SingleDocumentPreparer {
-    /// Creates a reusable preparer that only prepares fields required by `evaluator`.
+    /// Creates a reusable preparer that only prepares `required_fields`.
     ///
-    /// The evaluator must report its exact requirements. Documents produced by this preparer may
-    /// only be evaluated by `evaluator` or by another evaluator whose required fields are a subset
-    /// of `evaluator`'s. Incompatible reuse is rejected by
-    /// [`SingleDocumentEvaluator::evaluate`].
+    /// `required_fields` must cover every field that an evaluator may read. Incompatible reuse is
+    /// rejected by [`SingleDocumentEvaluator::evaluate`](super::SingleDocumentEvaluator::evaluate).
     ///
     /// Every required field must occur at least once as a top-level field in each input document.
     /// Supply [`crate::schema::OwnedValue::Null`] when a required field has no value. The `Null`
     /// counts as explicitly supplied but is not sent through Tantivy's type-specific indexing
     /// logic and emits no term, token, position, or fieldnorm.
-    pub fn for_evaluator(
+    pub fn for_fields(
         schema: &Schema,
         tokenizer_manager: &TokenizerManager,
-        evaluator: &dyn SingleDocumentEvaluator,
+        required_fields: &[Field],
     ) -> crate::Result<Self> {
-        let Some(required_fields) = evaluator.required_fields() else {
-            return Err(TantivyError::InvalidArgument(
-                "SingleDocumentPreparer requires the evaluator to report exact required fields"
-                    .to_string(),
-            ));
-        };
         let mut required_fields = required_fields.to_vec();
         required_fields.sort_unstable();
         required_fields.dedup();
@@ -130,8 +123,8 @@ impl SingleDocumentPreparer {
         for (&field, &was_provided) in self.required_fields.iter().zip(&provided_required_fields) {
             if !was_provided {
                 return Err(TantivyError::InvalidArgument(format!(
-                    "SingleDocumentPreparer requires field {:?} to be explicitly supplied; \
-                     use OwnedValue::Null when it has no value",
+                    "SingleDocumentPreparer requires field {:?} to be explicitly supplied; use \
+                     OwnedValue::Null when it has no value",
                     self.schema.get_field_entry(field).name()
                 )));
             }
@@ -190,7 +183,7 @@ impl SingleDocumentPreparer {
 ///     SingleDocumentEvaluationContext::without_scoring(&schema),
 /// )?;
 /// let mut preparer =
-///     SingleDocumentPreparer::for_evaluator(&schema, index.tokenizers(), evaluator.as_ref())?;
+///     SingleDocumentPreparer::for_fields(&schema, index.tokenizers(), &[body])?;
 /// let prepared = preparer.prepare(&document)?;
 /// assert_eq!(
 ///     evaluator.evaluate(&prepared)?,
@@ -201,7 +194,7 @@ impl SingleDocumentPreparer {
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct PreparedSingleDocument {
-    term_positions: HashMap<Term, Vec<u32>>,
+    term_positions: Vec<(Term, Vec<u32>)>,
     fieldnorm_ids: HashMap<Field, u8>,
     total_num_tokens_by_field: HashMap<Field, u64>,
     prepared_fields: Arc<[Field]>,
@@ -224,11 +217,53 @@ impl PreparedSingleDocument {
 impl SingleDocument for PreparedSingleDocument {
     fn term_info(&self, term: &Term) -> Option<SingleDocumentTermInfo<'_>> {
         self.term_positions
-            .get(term)
+            .binary_search_by(|(candidate, _)| candidate.cmp(term))
+            .ok()
+            .map(|term_index| &self.term_positions[term_index].1)
             .map(|positions| SingleDocumentTermInfo {
                 term_freq: positions.len() as u32,
                 positions: Some(positions.as_slice()),
             })
+    }
+
+    fn visit_terms(
+        &self,
+        field: Field,
+        range: (Bound<&Term>, Bound<&Term>),
+        visitor: &mut dyn FnMut(&Term, SingleDocumentTermInfo<'_>) -> bool,
+    ) {
+        let field_start = self
+            .term_positions
+            .partition_point(|(term, _)| term.field() < field);
+        let field_end = field_start
+            + self.term_positions[field_start..].partition_point(|(term, _)| term.field() == field);
+        let field_terms = &self.term_positions[field_start..field_end];
+
+        let range_start = match range.0 {
+            Bound::Included(start) => field_terms.partition_point(|(term, _)| term < start),
+            Bound::Excluded(start) => field_terms.partition_point(|(term, _)| term <= start),
+            Bound::Unbounded => 0,
+        };
+        let range_end = match range.1 {
+            Bound::Included(end) => field_terms.partition_point(|(term, _)| term <= end),
+            Bound::Excluded(end) => field_terms.partition_point(|(term, _)| term < end),
+            Bound::Unbounded => field_terms.len(),
+        };
+        if range_start >= range_end {
+            return;
+        }
+
+        for (term, positions) in &field_terms[range_start..range_end] {
+            if !visitor(
+                term,
+                SingleDocumentTermInfo {
+                    term_freq: positions.len() as u32,
+                    positions: Some(positions.as_slice()),
+                },
+            ) {
+                break;
+            }
+        }
     }
 
     fn fieldnorm_id(&self, field: Field) -> Option<u8> {
@@ -238,8 +273,8 @@ impl SingleDocument for PreparedSingleDocument {
     fn validate_required_fields(&self, required_fields: Option<&[Field]>) -> crate::Result<()> {
         let Some(required_fields) = required_fields else {
             return Err(TantivyError::InvalidArgument(
-                "PreparedSingleDocument was query-aware, but the evaluator's required fields \
-                 are unknown"
+                "PreparedSingleDocument was query-aware, but the evaluator's required fields are \
+                 unknown"
                     .to_string(),
             ));
         };
@@ -291,7 +326,10 @@ impl PreparedDocumentIndexingOutput {
     }
 
     fn take_prepared_document(&mut self, prepared_fields: Arc<[Field]>) -> PreparedSingleDocument {
-        let term_positions = std::mem::take(&mut self.postings_writer.term_positions);
+        let mut term_positions = std::mem::take(&mut self.postings_writer.term_positions)
+            .into_iter()
+            .collect::<Vec<_>>();
+        term_positions.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         let mut total_num_tokens_by_field = HashMap::new();
         for (term, positions) in &term_positions {
             *total_num_tokens_by_field.entry(term.field()).or_default() += positions.len() as u64;

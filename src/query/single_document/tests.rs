@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Bound;
 
 use super::{
     DocumentEvaluation, SingleDocument, SingleDocumentEvaluationContext, SingleDocumentEvaluator,
@@ -8,11 +9,12 @@ use crate::core::json_utils::JsonTermWriter;
 use crate::fieldnorm::FieldNormReader;
 use crate::query::{
     AllQuery, Bm25StatisticsProvider, BooleanQuery, BoostQuery, ConstScoreQuery, EmptyQuery,
-    EnableScoring, Occur, PhraseQuery, Query, RegexQuery, TermQuery, TermSetQuery,
+    EnableScoring, FuzzyTermQuery, Occur, PhrasePrefixQuery, PhraseQuery, Query, RegexQuery,
+    TermQuery, TermSetQuery,
 };
 use crate::schema::{
     Field, IndexRecordOption, OwnedValue, Schema, TextFieldIndexing, TextOptions, Type, INDEXED,
-    STORED, TEXT,
+    STORED, STRING, TEXT,
 };
 use crate::tokenizer::{PreTokenizedString, Token, TokenizerManager, WhitespaceTokenizer};
 use crate::{DocSet, Index, IndexWriter, TantivyDocument, TantivyError, Term, TERMINATED};
@@ -58,22 +60,46 @@ impl SingleDocument for TestDocument {
     fn fieldnorm_id(&self, field: Field) -> Option<u8> {
         self.fieldnorms.get(&field).copied()
     }
-}
 
-struct RequiredFieldsEvaluator {
-    fields: Vec<Field>,
-}
-
-impl SingleDocumentEvaluator for RequiredFieldsEvaluator {
-    fn evaluate_impl(
-        &mut self,
-        _document: &dyn SingleDocument,
-    ) -> crate::Result<DocumentEvaluation> {
-        Ok(DocumentEvaluation::NoMatch)
-    }
-
-    fn required_fields(&self) -> Option<&[Field]> {
-        Some(&self.fields)
+    fn visit_terms(
+        &self,
+        field: Field,
+        range: (Bound<&Term>, Bound<&Term>),
+        visitor: &mut dyn FnMut(&Term, SingleDocumentTermInfo<'_>) -> bool,
+    ) {
+        let mut terms = self
+            .term_freqs
+            .iter()
+            .filter(|(term, _)| term.field() == field)
+            .collect::<Vec<_>>();
+        terms.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        for (term, &term_freq) in terms {
+            let after_start = match range.0 {
+                Bound::Included(start) => term >= start,
+                Bound::Excluded(start) => term > start,
+                Bound::Unbounded => true,
+            };
+            if !after_start {
+                continue;
+            }
+            let before_end = match range.1 {
+                Bound::Included(end) => term <= end,
+                Bound::Excluded(end) => term < end,
+                Bound::Unbounded => true,
+            };
+            if !before_end {
+                break;
+            }
+            if !visitor(
+                term,
+                SingleDocumentTermInfo {
+                    term_freq,
+                    positions: self.positions.get(term).map(Vec::as_slice),
+                },
+            ) {
+                break;
+            }
+        }
     }
 }
 
@@ -82,10 +108,7 @@ fn preparer_for_fields(
     tokenizer_manager: &TokenizerManager,
     fields: &[Field],
 ) -> crate::Result<SingleDocumentPreparer> {
-    let evaluator = RequiredFieldsEvaluator {
-        fields: fields.to_vec(),
-    };
-    SingleDocumentPreparer::for_evaluator(schema, tokenizer_manager, &evaluator)
+    SingleDocumentPreparer::for_fields(schema, tokenizer_manager, fields)
 }
 
 fn text_schema() -> (Schema, Field) {
@@ -257,6 +280,410 @@ fn term_without_scoring_reports_match_and_no_match() -> crate::Result<()> {
         evaluator.evaluate(&matching_document)?,
         DocumentEvaluation::Match(1.0)
     );
+    Ok(())
+}
+
+#[test]
+fn single_document_fuzzy_evaluation_matches_segment_scorer() -> crate::Result<()> {
+    let (schema, field) = text_schema();
+    let index = Index::create_in_ram(schema.clone());
+    let mut writer: IndexWriter = index.writer_for_tests()?;
+    writer.add_document(doc!(field => "rust search"))?;
+    writer.add_document(doc!(field => "database"))?;
+    writer.commit()?;
+    let searcher = index.reader()?.searcher();
+
+    let mut document = TantivyDocument::new();
+    document.add_text(field, "rust search");
+    let mut preparer = preparer_for_fields(&schema, index.tokenizers(), &[field])?;
+    let prepared = preparer.prepare(&document)?;
+
+    let queries = [
+        FuzzyTermQuery::new_prefix(Term::from_field_text(field, "rus"), 0, true),
+        FuzzyTermQuery::new(Term::from_field_text(field, "ruse"), 1, true),
+        FuzzyTermQuery::new(Term::from_field_text(field, "rsut"), 1, true),
+    ];
+    for query in queries {
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
+        assert_eq!(scorer.doc(), 0);
+        let expected_score = scorer.score();
+
+        let mut evaluator = query.single_document_evaluator(
+            SingleDocumentEvaluationContext::with_scoring(&schema, &searcher),
+        )?;
+        let DocumentEvaluation::Match(actual_score) = evaluator.evaluate(&prepared)? else {
+            panic!("fuzzy query should match");
+        };
+        assert_eq!(actual_score, expected_score);
+        assert_eq!(evaluator.required_fields(), Some([field].as_slice()));
+    }
+
+    let query = FuzzyTermQuery::new_prefix(Term::from_field_text(field, "sql"), 0, true);
+    let mut evaluator = query
+        .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
+    assert_eq!(evaluator.evaluate(&prepared)?, DocumentEvaluation::NoMatch);
+    Ok(())
+}
+
+#[test]
+fn single_document_fuzzy_json_path_is_filtered() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let attributes = schema_builder.add_json_field("attributes", TEXT);
+    let schema = schema_builder.build();
+    let index = Index::create_in_ram(schema.clone());
+    let document = doc!(attributes => serde_json::json!({"a": "japan"}));
+    let mut preparer = preparer_for_fields(&schema, index.tokenizers(), &[attributes])?;
+    let prepared = preparer.prepare(&document)?;
+
+    let json_term = |path: &str, text: &str| {
+        let mut term = Term::with_type_and_field(Type::Json, attributes);
+        let mut writer = JsonTermWriter::wrap(&mut term, false);
+        writer.push_path_segment(path);
+        writer.set_str(text);
+        drop(writer);
+        term
+    };
+
+    // The extra `a` in the JSON path is within the fuzzy distance, but paths must be exact.
+    let wrong_path_query = FuzzyTermQuery::new(json_term("aa", "japan"), 2, true);
+    let mut wrong_path_evaluator = wrong_path_query
+        .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
+    assert_eq!(
+        wrong_path_evaluator.evaluate(&prepared)?,
+        DocumentEvaluation::NoMatch
+    );
+
+    let matching_query = FuzzyTermQuery::new(json_term("a", "japon"), 1, true);
+    let mut matching_evaluator = matching_query
+        .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
+    assert_eq!(
+        matching_evaluator.evaluate(&prepared)?,
+        DocumentEvaluation::Match(1.0)
+    );
+    Ok(())
+}
+
+#[test]
+fn single_document_phrase_prefix_score_matches_segment_scorer() -> crate::Result<()> {
+    let (schema, field) = text_schema();
+    let index = Index::create_in_ram(schema.clone());
+    let mut writer: IndexWriter = index.writer_for_tests()?;
+    writer.add_document(doc!(field => "rust database systems"))?;
+    writer.add_document(doc!(field => "rust database storage"))?;
+    writer.commit()?;
+    let searcher = index.reader()?.searcher();
+    let query = PhrasePrefixQuery::new(vec![
+        Term::from_field_text(field, "rust"),
+        Term::from_field_text(field, "database"),
+        Term::from_field_text(field, "sys"),
+    ]);
+
+    let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+    let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
+    assert_eq!(scorer.doc(), 0);
+    let expected_score = scorer.score();
+
+    let mut matching_document = TantivyDocument::new();
+    matching_document.add_text(field, "rust database systems");
+    let mut non_matching_document = TantivyDocument::new();
+    non_matching_document.add_text(field, "rust database storage");
+    let mut preparer = preparer_for_fields(&schema, index.tokenizers(), &[field])?;
+    let matching_prepared = preparer.prepare(&matching_document)?;
+    let non_matching_prepared = preparer.prepare(&non_matching_document)?;
+    let mut evaluator = query.single_document_evaluator(
+        SingleDocumentEvaluationContext::with_scoring(&schema, &searcher),
+    )?;
+
+    let DocumentEvaluation::Match(actual_score) = evaluator.evaluate(&matching_prepared)? else {
+        panic!("phrase prefix query should match");
+    };
+    assert!((actual_score - expected_score).abs() <= 1e-6);
+    assert_eq!(
+        evaluator.evaluate(&non_matching_prepared)?,
+        DocumentEvaluation::NoMatch
+    );
+    assert_eq!(evaluator.required_fields(), Some([field].as_slice()));
+    Ok(())
+}
+
+#[test]
+fn single_document_phrase_prefix_with_non_adjacent_offsets_matches_segment_scorer(
+) -> crate::Result<()> {
+    let (schema, field) = text_schema();
+    let index = Index::create_in_ram(schema.clone());
+    let mut writer: IndexWriter = index.writer_for_tests()?;
+    writer.add_document(doc!(field => "a x b cat"))?;
+    writer.add_document(doc!(field => "d x dog"))?;
+    writer.commit()?;
+    let searcher = index.reader()?.searcher();
+
+    let term = |text| Term::from_field_text(field, text);
+    let cases = [
+        // Preserve a gap between the fixed terms while keeping the prefix immediately after the
+        // greatest fixed-term offset, as the segment scorer's multi-fixed-term path expects.
+        (
+            PhrasePrefixQuery::new_with_offset(vec![
+                (0, term("a")),
+                (2, term("b")),
+                (3, term("c")),
+            ]),
+            0,
+            "a x b cat",
+            "a b cat",
+        ),
+        // The segment scorer's single-fixed-term path aligns directly to the explicit prefix
+        // offset, so exercise a gap between that fixed term and the prefix as well.
+        (
+            PhrasePrefixQuery::new_with_offset(vec![(0, term("d")), (2, term("do"))]),
+            1,
+            "d x dog",
+            "d dog",
+        ),
+    ];
+    let mut preparer = preparer_for_fields(&schema, index.tokenizers(), &[field])?;
+
+    for (query, expected_doc, matching_text, non_matching_text) in cases {
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
+        assert_eq!(scorer.doc(), expected_doc);
+        let expected_score = scorer.score();
+        assert_eq!(scorer.advance(), TERMINATED);
+
+        let mut matching_document = TantivyDocument::new();
+        matching_document.add_text(field, matching_text);
+        let matching_prepared = preparer.prepare(&matching_document)?;
+        let mut non_matching_document = TantivyDocument::new();
+        non_matching_document.add_text(field, non_matching_text);
+        let non_matching_prepared = preparer.prepare(&non_matching_document)?;
+        let mut evaluator = query.single_document_evaluator(
+            SingleDocumentEvaluationContext::with_scoring(&schema, &searcher),
+        )?;
+
+        let DocumentEvaluation::Match(actual_score) = evaluator.evaluate(&matching_prepared)?
+        else {
+            panic!("phrase prefix query with non-adjacent offsets should match");
+        };
+        assert!((actual_score - expected_score).abs() <= 1e-6);
+        assert_eq!(
+            evaluator.evaluate(&non_matching_prepared)?,
+            DocumentEvaluation::NoMatch
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn single_document_phrase_prefix_honors_document_expansion_order() -> crate::Result<()> {
+    let (schema, field) = text_schema();
+    let index = Index::create_in_ram(schema.clone());
+    let mut document = TantivyDocument::new();
+    document.add_text(field, "x cb y x ca");
+    let mut preparer = preparer_for_fields(&schema, index.tokenizers(), &[field])?;
+    let prepared = preparer.prepare(&document)?;
+
+    let mut query = PhrasePrefixQuery::new(vec![
+        Term::from_field_text(field, "x"),
+        Term::from_field_text(field, "c"),
+    ]);
+    query.set_max_expansions(1);
+    let mut evaluator = query
+        .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
+    assert_eq!(
+        evaluator.evaluate(&prepared)?,
+        DocumentEvaluation::Match(1.0)
+    );
+    Ok(())
+}
+
+#[test]
+fn single_document_phrase_prefix_bounds_term_visit_to_prefix() -> crate::Result<()> {
+    struct RangeCheckingDocument {
+        field: Field,
+        prefix: Term,
+        end: Term,
+        matching_term: Term,
+    }
+
+    impl SingleDocument for RangeCheckingDocument {
+        fn term_info(&self, _term: &Term) -> Option<SingleDocumentTermInfo<'_>> {
+            None
+        }
+
+        fn fieldnorm_id(&self, _field: Field) -> Option<u8> {
+            None
+        }
+
+        fn visit_terms(
+            &self,
+            field: Field,
+            range: (Bound<&Term>, Bound<&Term>),
+            visitor: &mut dyn FnMut(&Term, SingleDocumentTermInfo<'_>) -> bool,
+        ) {
+            assert_eq!(field, self.field);
+            assert!(matches!(range.0, Bound::Included(term) if term == &self.prefix));
+            assert!(matches!(range.1, Bound::Excluded(term) if term == &self.end));
+            visitor(
+                &self.matching_term,
+                SingleDocumentTermInfo {
+                    term_freq: 1,
+                    positions: None,
+                },
+            );
+        }
+    }
+
+    let (schema, field) = text_schema();
+    let prefix = Term::from_field_text(field, "ca");
+    let document = RangeCheckingDocument {
+        field,
+        prefix: prefix.clone(),
+        end: Term::from_field_text(field, "cb"),
+        matching_term: Term::from_field_text(field, "cable"),
+    };
+    let query = PhrasePrefixQuery::new(vec![prefix]);
+    let mut evaluator = query
+        .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
+    assert_eq!(
+        evaluator.evaluate(&document)?,
+        DocumentEvaluation::Match(1.0)
+    );
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "strictly ascending order")]
+fn single_document_phrase_prefix_debug_asserts_visit_terms_order() {
+    struct UnsortedTermsDocument {
+        terms: Vec<Term>,
+    }
+
+    impl SingleDocument for UnsortedTermsDocument {
+        fn term_info(&self, _term: &Term) -> Option<SingleDocumentTermInfo<'_>> {
+            None
+        }
+
+        fn fieldnorm_id(&self, _field: Field) -> Option<u8> {
+            None
+        }
+
+        fn visit_terms(
+            &self,
+            _field: Field,
+            _range: (Bound<&Term>, Bound<&Term>),
+            visitor: &mut dyn FnMut(&Term, SingleDocumentTermInfo<'_>) -> bool,
+        ) {
+            for term in &self.terms {
+                if !visitor(
+                    term,
+                    SingleDocumentTermInfo {
+                        term_freq: 1,
+                        positions: None,
+                    },
+                ) {
+                    break;
+                }
+            }
+        }
+    }
+
+    let (schema, field) = text_schema();
+    let mut query = PhrasePrefixQuery::new(vec![Term::from_field_text(field, "c")]);
+    query.set_max_expansions(1);
+    let mut evaluator = query
+        .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))
+        .unwrap();
+    let document = UnsortedTermsDocument {
+        terms: vec![
+            Term::from_field_text(field, "cb"),
+            Term::from_field_text(field, "ca"),
+        ],
+    };
+
+    let _ = evaluator.evaluate(&document);
+}
+
+#[test]
+fn single_term_phrase_prefix_does_not_require_positions() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let field = schema_builder.add_text_field("body", STRING);
+    let schema = schema_builder.build();
+    let index = Index::create_in_ram(schema.clone());
+    let mut document = TantivyDocument::new();
+    document.add_text(field, "rust");
+    let mut preparer = preparer_for_fields(&schema, index.tokenizers(), &[field])?;
+    let prepared = preparer.prepare(&document)?;
+    let query = PhrasePrefixQuery::new(vec![Term::from_field_text(field, "rus")]);
+    let mut evaluator = query
+        .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
+    assert_eq!(
+        evaluator.evaluate(&prepared)?,
+        DocumentEvaluation::Match(1.0)
+    );
+    Ok(())
+}
+
+#[test]
+fn single_document_phrase_prefix_rejects_mismatched_term_type() {
+    let (schema, field) = text_schema();
+    let text_term = Term::from_field_text(field, "rust");
+    let u64_term = Term::from_field_u64(field, 42);
+    let queries = [
+        PhrasePrefixQuery::new(vec![u64_term.clone()]),
+        PhrasePrefixQuery::new(vec![u64_term.clone(), text_term.clone()]),
+        PhrasePrefixQuery::new(vec![text_term, u64_term]),
+    ];
+
+    for query in queries {
+        let error = query
+            .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            TantivyError::SchemaError(message)
+                if message
+                    == "Create a phrase prefix query of the type U64, when the field given was of \
+                        type Str"
+        ));
+    }
+}
+
+#[test]
+fn single_term_phrase_prefix_score_matches_segment_range_query() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let field = schema_builder.add_text_field("body", STRING);
+    let schema = schema_builder.build();
+    let index = Index::create_in_ram(schema.clone());
+    let mut writer: IndexWriter = index.writer_for_tests()?;
+    writer.add_document(doc!(field => "rust"))?;
+    writer.commit()?;
+    let searcher = index.reader()?.searcher();
+
+    let query = BoostQuery::new(
+        Box::new(PhrasePrefixQuery::new(vec![Term::from_field_text(
+            field, "rus",
+        )])),
+        2.5,
+    );
+    let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+    let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
+    assert_eq!(scorer.doc(), 0);
+    let expected_score = scorer.score();
+
+    let mut document = TantivyDocument::new();
+    document.add_text(field, "rust");
+    let mut preparer = preparer_for_fields(&schema, index.tokenizers(), &[field])?;
+    let prepared = preparer.prepare(&document)?;
+    let mut evaluator = query.single_document_evaluator(
+        SingleDocumentEvaluationContext::with_scoring(&schema, &searcher),
+    )?;
+    let DocumentEvaluation::Match(actual_score) = evaluator.evaluate(&prepared)? else {
+        panic!("prefix-only phrase prefix query should match");
+    };
+    assert_eq!(actual_score, expected_score);
+    assert_eq!(actual_score, 2.5);
     Ok(())
 }
 
@@ -1192,6 +1619,34 @@ fn prepared_document_matches_text_indexing_semantics() -> crate::Result<()> {
 }
 
 #[test]
+fn prepared_document_visit_terms_honors_range() -> crate::Result<()> {
+    let (schema, field) = text_schema();
+    let index = Index::create_in_ram(schema.clone());
+    let document = doc!(field => "aa ab ac ba");
+    let mut preparer = preparer_for_fields(&schema, index.tokenizers(), &[field])?;
+    let prepared = preparer.prepare(&document)?;
+    let lower = Term::from_field_text(field, "ab");
+    let upper = Term::from_field_text(field, "ba");
+    let mut visited = Vec::new();
+    prepared.visit_terms(
+        field,
+        (Bound::Excluded(&lower), Bound::Included(&upper)),
+        &mut |term, _| {
+            visited.push(term.clone());
+            true
+        },
+    );
+    assert_eq!(
+        visited,
+        vec![
+            Term::from_field_text(field, "ac"),
+            Term::from_field_text(field, "ba")
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn evaluator_evaluates_a_prepared_regular_document() -> crate::Result<()> {
     let (schema, field) = text_schema();
     let index = Index::create_in_ram(schema.clone());
@@ -1203,8 +1658,7 @@ fn evaluator_evaluates_a_prepared_regular_document() -> crate::Result<()> {
     );
     let mut evaluator = query
         .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
-    let mut preparer =
-        SingleDocumentPreparer::for_evaluator(&schema, index.tokenizers(), evaluator.as_ref())?;
+    let mut preparer = SingleDocumentPreparer::for_fields(&schema, index.tokenizers(), &[field])?;
     let prepared = preparer.prepare(&document)?;
 
     assert_eq!(
@@ -1290,6 +1744,33 @@ fn prepared_document_uses_the_supplied_tokenizer_manager() -> crate::Result<()> 
 }
 
 #[test]
+fn single_document_preparer_normalizes_and_validates_fields() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let title = schema_builder.add_text_field("title", TEXT);
+    let body = schema_builder.add_text_field("body", TEXT);
+    let schema = schema_builder.build();
+    let tokenizer_manager = TokenizerManager::default();
+
+    let mut preparer =
+        SingleDocumentPreparer::for_fields(&schema, &tokenizer_manager, &[body, title, body])?;
+    let document = doc!(title => "Rust", body => "Search");
+    let prepared = preparer.prepare(&document)?;
+    assert!(prepared
+        .term_info(&Term::from_field_text(title, "rust"))
+        .is_some());
+    assert!(prepared
+        .term_info(&Term::from_field_text(body, "search"))
+        .is_some());
+
+    let unknown_field = Field::from_field_id(schema.num_fields() as u32);
+    let error = SingleDocumentPreparer::for_fields(&schema, &tokenizer_manager, &[unknown_field])
+        .err()
+        .unwrap();
+    assert!(matches!(error, TantivyError::SchemaError(_)));
+    Ok(())
+}
+
+#[test]
 fn prepared_document_encodes_numeric_and_json_terms() -> crate::Result<()> {
     let mut schema_builder = Schema::builder();
     let number = schema_builder.add_u64_field("number", INDEXED);
@@ -1363,7 +1844,7 @@ fn single_document_preparer_can_be_reused() -> crate::Result<()> {
 }
 
 #[test]
-fn single_document_preparer_only_indexes_evaluator_fields() -> crate::Result<()> {
+fn single_document_preparer_only_indexes_configured_fields() -> crate::Result<()> {
     let ignored_options = TextOptions::default()
         .set_indexing_options(TextFieldIndexing::default().set_tokenizer("missing_tokenizer"));
     let mut schema_builder = Schema::builder();
@@ -1382,7 +1863,7 @@ fn single_document_preparer_only_indexes_evaluator_fields() -> crate::Result<()>
         Some([queried_field].as_slice())
     );
     let mut preparer =
-        SingleDocumentPreparer::for_evaluator(&schema, &tokenizer_manager, evaluator.as_ref())?;
+        SingleDocumentPreparer::for_fields(&schema, &tokenizer_manager, &[queried_field])?;
     let mut document = TantivyDocument::new();
     document.add_text(queried_field, "Rust search");
     document.add_text(ignored_field, "ignored text");
@@ -1398,27 +1879,6 @@ fn single_document_preparer_only_indexes_evaluator_fields() -> crate::Result<()>
         .term_info(&Term::from_field_text(ignored_field, "ignored"))
         .is_none());
 
-    struct UnknownRequirementsEvaluator;
-    impl SingleDocumentEvaluator for UnknownRequirementsEvaluator {
-        fn evaluate_impl(
-            &mut self,
-            _document: &dyn SingleDocument,
-        ) -> crate::Result<DocumentEvaluation> {
-            Ok(DocumentEvaluation::NoMatch)
-        }
-    }
-    let error = SingleDocumentPreparer::for_evaluator(
-        &schema,
-        &tokenizer_manager,
-        &UnknownRequirementsEvaluator,
-    )
-    .err()
-    .unwrap();
-    assert!(matches!(
-        error,
-        TantivyError::InvalidArgument(message)
-            if message.contains("report exact required fields")
-    ));
     Ok(())
 }
 
@@ -1430,11 +1890,8 @@ fn query_aware_preparer_checks_presence_and_skips_top_level_null() -> crate::Res
     let query = TermQuery::new(Term::from_field_u64(number, 42), IndexRecordOption::Basic);
     let mut evaluator = query
         .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
-    let mut preparer = SingleDocumentPreparer::for_evaluator(
-        &schema,
-        &TokenizerManager::default(),
-        evaluator.as_ref(),
-    )?;
+    let mut preparer =
+        SingleDocumentPreparer::for_fields(&schema, &TokenizerManager::default(), &[number])?;
 
     let missing_error = preparer.prepare(&TantivyDocument::new()).err().unwrap();
     assert!(matches!(
@@ -1502,11 +1959,8 @@ fn query_aware_prepared_document_rejects_broader_evaluator() -> crate::Result<()
     let mut body_evaluator = body_query
         .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
 
-    let mut query_aware_preparer = SingleDocumentPreparer::for_evaluator(
-        &schema,
-        &tokenizer_manager,
-        title_evaluator.as_ref(),
-    )?;
+    let mut query_aware_preparer =
+        SingleDocumentPreparer::for_fields(&schema, &tokenizer_manager, &[title])?;
     let mut document = TantivyDocument::new();
     document.add_text(title, "Rust");
     let query_aware_document = query_aware_preparer.prepare(&document)?;
