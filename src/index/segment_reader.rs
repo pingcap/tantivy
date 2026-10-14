@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ops::BitOrAssign;
+use std::ops::{BitOrAssign, Range};
 use std::sync::{Arc, RwLock};
 use std::{fmt, io};
 
@@ -205,6 +205,24 @@ impl SegmentReader {
             positions_composite,
             schema,
         })
+    }
+
+    /// Returns the field's byte range relative to the start of the `.idx` component.
+    ///
+    /// The range includes the field's eight-byte token-count header. Add eight to
+    /// its start before translating a `TermInfo::postings_range` to component offsets.
+    /// Returns `None` if the field has no postings entry in this segment.
+    pub fn postings_field_range(&self, field: Field) -> Option<Range<usize>> {
+        self.postings_composite.field_range(field)
+    }
+
+    /// Returns the field's byte range relative to the start of the `.pos` component.
+    ///
+    /// `TermInfo::positions_range` is relative to the start of this range.
+    /// A field without positions can have an empty range. Returns `None` if the
+    /// field has no positions entry in this segment.
+    pub fn positions_field_range(&self, field: Field) -> Option<Range<usize>> {
+        self.positions_composite.field_range(field)
     }
 
     /// Returns a field reader associated with the field given in argument.
@@ -518,6 +536,77 @@ mod test {
     use crate::index::Index;
     use crate::schema::{SchemaBuilder, Term, STORED, TEXT};
     use crate::IndexWriter;
+
+    #[test]
+    fn test_field_ranges_use_component_offsets_with_missing_and_exact_fields() -> crate::Result<()>
+    {
+        use common::BinarySerializable;
+
+        use crate::schema::STRING;
+
+        let mut schema = Schema::builder();
+        let empty_first = schema.add_text_field("empty_first", TEXT);
+        let body = schema.add_text_field("body", TEXT);
+        let empty_middle = schema.add_text_field("empty_middle", TEXT);
+        let exact = schema.add_text_field("exact", STRING);
+        let title = schema.add_text_field("title", TEXT);
+        let stored = schema.add_text_field("stored", STORED);
+        let empty_last = schema.add_text_field("empty_last", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.add_document(
+            doc!(body => "alpha beta", exact => "key", title => "gamma delta", stored => "value"),
+        )?;
+        writer.commit()?;
+
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let reader = searcher.segment_reader(0);
+        for field in [empty_first, empty_middle, stored, empty_last] {
+            assert_eq!(reader.postings_field_range(field), None);
+            assert_eq!(reader.positions_field_range(field), None);
+        }
+
+        let segment = index.searchable_segments()?.pop().unwrap();
+        let postings = segment.open_read(SegmentComponent::Postings)?;
+        let positions = segment.open_read(SegmentComponent::Positions)?;
+        let mut last_postings_end = 0;
+        let mut last_positions_end = 0;
+        for field in [body, exact, title] {
+            let postings_range = reader.postings_field_range(field).unwrap();
+            let positions_range = reader.positions_field_range(field).unwrap();
+            assert_eq!(postings_range.start, last_postings_end);
+            assert_eq!(positions_range.start, last_positions_end);
+            assert!(postings_range.len() > 8);
+            assert_eq!(positions_range.is_empty(), field == exact);
+
+            let header = postings
+                .slice(postings_range.start..postings_range.start + 8)
+                .read_bytes()?;
+            let inv = reader.inverted_index(field)?;
+            assert_eq!(
+                u64::deserialize(&mut header.as_slice())?,
+                inv.total_num_tokens()
+            );
+            let mut terms = inv.terms().stream()?;
+            while terms.advance() {
+                let term = terms.value();
+                let term_postings = postings_range.start + 8 + term.postings_range.start
+                    ..postings_range.start + 8 + term.postings_range.end;
+                assert!(term_postings.end <= postings_range.end);
+                assert!(!postings.slice(term_postings).read_bytes()?.is_empty());
+                if field != exact {
+                    let term_positions = positions_range.start + term.positions_range.start
+                        ..positions_range.start + term.positions_range.end;
+                    assert!(term_positions.end <= positions_range.end);
+                    assert!(!positions.slice(term_positions).read_bytes()?.is_empty());
+                }
+            }
+            last_postings_end = postings_range.end;
+            last_positions_end = positions_range.end;
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_merge_field_meta_data_same() {
