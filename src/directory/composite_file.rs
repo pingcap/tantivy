@@ -159,6 +159,12 @@ impl CompositeFile {
         self.open_read_with_idx(field, 0)
     }
 
+    /// Returns the field's byte range relative to the start of the composite file.
+    /// Returns `None` if the field has no entry at index zero.
+    pub fn field_range(&self, field: Field) -> Option<Range<usize>> {
+        self.offsets_index.get(&FileAddr::new(field, 0)).cloned()
+    }
+
     /// Returns the `FileSlice` associated with
     /// a given `Field` and stored in a `CompositeFile`.
     pub fn open_read_with_idx(&self, field: Field, idx: usize) -> Option<FileSlice> {
@@ -254,6 +260,20 @@ mod test {
         {
             let r = directory.open_read(path)?;
             let composite_file = CompositeFile::open(&r)?;
+            // Physical order differs from field IDs, and the extra slice is empty.
+            assert_eq!(
+                composite_file.field_range(Field::from_field_id(1)),
+                Some(0..4)
+            );
+            assert_eq!(
+                composite_file.field_range(Field::from_field_id(0)),
+                Some(4..7)
+            );
+            assert_eq!(composite_file.field_range(Field::from_field_id(2)), None);
+            assert_eq!(
+                CompositeFile::empty().field_range(Field::from_field_id(0)),
+                None
+            );
             {
                 let file = composite_file
                     .open_read_with_idx(Field::from_field_id(1u32), 0)
