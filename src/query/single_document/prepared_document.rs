@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io;
+use std::mem::{align_of, size_of, size_of_val};
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -201,6 +202,34 @@ pub struct PreparedSingleDocument {
 }
 
 impl PreparedSingleDocument {
+    /// Returns an estimate of the heap bytes retained by this document.
+    ///
+    /// Counts allocation capacities, including unused vector and term-buffer capacity. Field-map
+    /// storage is estimated at twice the usable capacity, with one control byte per bucket, to
+    /// allow for spare buckets and metadata without depending on the hash table's private layout.
+    /// Shared prepared-field storage is charged in full regardless of its reference count, with an
+    /// allowance for two reference counters rounded to pointer alignment. This is conservative
+    /// when several documents share the same field storage.
+    ///
+    /// Excludes the inline size of `Self`, allocator bookkeeping, and the preparer's working
+    /// memory. The calculation does not allocate and is linear in the number of distinct terms.
+    pub fn heap_memory_usage(&self) -> usize {
+        let pointer_alignment = align_of::<usize>();
+        let shared_fields_bytes = (size_of_val(self.prepared_fields.as_ref())
+            + 2 * size_of::<usize>()
+            + pointer_alignment
+            - 1)
+            & !(pointer_alignment - 1);
+        let mut bytes = shared_fields_bytes
+            + self.term_positions.capacity() * size_of::<(Term, Vec<u32>)>()
+            + 2 * self.fieldnorm_ids.capacity() * (size_of::<(Field, u8)>() + 1)
+            + 2 * self.total_num_tokens_by_field.capacity() * (size_of::<(Field, u64)>() + 1);
+        for (term, positions) in &self.term_positions {
+            bytes += term.heap_memory_usage() + positions.capacity() * size_of::<u32>();
+        }
+        bytes
+    }
+
     /// Returns the exact number of indexed tokens for `field` in this document.
     ///
     /// Unlike [`Self::fieldnorm_id`], this value is not compressed. It can be
@@ -423,5 +452,99 @@ impl PostingsWriter for PreparedDocumentPostingsWriter {
 
     fn total_num_tokens(&self) -> u64 {
         self.total_num_tokens
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::{DocumentEvaluation, Query, SingleDocumentEvaluationContext, TermQuery};
+    use crate::schema::{IndexRecordOption, OwnedValue, Schema, TantivyDocument, TEXT};
+
+    #[test]
+    fn heap_memory_usage_includes_spare_capacity_and_shared_fields() {
+        let field = Field::from_field_id(0);
+        let mut term = Term::with_capacity(1024);
+        term.set_field_and_type(field, Type::Str);
+        term.set_text("alpha");
+        let mut positions = Vec::with_capacity(512);
+        positions.push(0);
+        let mut term_positions = Vec::with_capacity(8);
+        let term_bytes = term.heap_memory_usage();
+        assert!(term_bytes >= 1024);
+        let position_bytes = positions.capacity() * size_of::<u32>();
+        term_positions.push((term, positions));
+        let mut fieldnorm_ids = HashMap::with_capacity(16);
+        fieldnorm_ids.insert(field, 1);
+        let mut total_num_tokens_by_field = HashMap::with_capacity(8);
+        total_num_tokens_by_field.insert(field, 1);
+        let document = PreparedSingleDocument {
+            term_positions,
+            fieldnorm_ids,
+            total_num_tokens_by_field,
+            prepared_fields: (0..64).map(Field::from_field_id).collect::<Vec<_>>().into(),
+        };
+        let allocation_bytes = document.term_positions.capacity() * size_of::<(Term, Vec<u32>)>()
+            + term_bytes
+            + position_bytes
+            + document.fieldnorm_ids.capacity() * size_of::<(Field, u8)>()
+            + document.total_num_tokens_by_field.capacity() * size_of::<(Field, u64)>()
+            + size_of_val(document.prepared_fields.as_ref());
+        let retained_bytes = document.heap_memory_usage();
+        assert!(retained_bytes >= allocation_bytes);
+        assert!(retained_bytes > 1024 + 512 * size_of::<u32>());
+        // Sharing the coverage allocation must not reduce an entry's charge.
+        let _shared_fields = Arc::clone(&document.prepared_fields);
+        assert_eq!(retained_bytes, document.heap_memory_usage());
+    }
+
+    #[test]
+    fn heap_memory_usage_is_stable_after_preparer_reuse_and_drop() -> crate::Result<()> {
+        let mut builder = Schema::builder();
+        let body = builder.add_text_field("body", TEXT);
+        let title = builder.add_text_field("title", TEXT);
+        let nullable = builder.add_text_field("nullable", TEXT);
+        let schema = builder.build();
+        let mut preparer = SingleDocumentPreparer::for_fields(
+            &schema,
+            &TokenizerManager::default(),
+            &[title, nullable, body],
+        )?;
+        let mut input = TantivyDocument::new();
+        input.add_text(title, "beta");
+        input.add_text(body, "alpha beta alpha");
+        input.add_field_value(nullable, OwnedValue::Null);
+        let prepared = preparer.prepare(&input)?;
+        let retained_bytes = prepared.heap_memory_usage();
+        assert_eq!(prepared.total_num_tokens(body), 3);
+        assert_eq!(prepared.total_num_tokens(title), 1);
+        assert_eq!(prepared.total_num_tokens(nullable), 0);
+        assert!(prepared.fieldnorm_id(body).is_some());
+        assert!(prepared.fieldnorm_id(title).is_some());
+        assert_eq!(prepared.fieldnorm_id(nullable), None);
+
+        let mut empty_input = TantivyDocument::new();
+        for field in [body, title, nullable] {
+            empty_input.add_field_value(field, OwnedValue::Null);
+        }
+        let empty = preparer.prepare(&empty_input)?;
+        drop(preparer);
+        assert!(empty.heap_memory_usage() > 0);
+        assert!(retained_bytes > empty.heap_memory_usage());
+        assert_eq!(prepared.heap_memory_usage(), retained_bytes);
+        assert_eq!(prepared.total_num_tokens(body), 3);
+        assert_eq!(empty.total_num_tokens(body), 0);
+        let query = TermQuery::new(
+            Term::from_field_text(body, "alpha"),
+            IndexRecordOption::WithFreqs,
+        );
+        let mut evaluator = query
+            .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
+        assert_eq!(
+            evaluator.evaluate(&prepared)?,
+            DocumentEvaluation::Match(1.0)
+        );
+        assert_eq!(evaluator.evaluate(&empty)?, DocumentEvaluation::NoMatch);
+        Ok(())
     }
 }
