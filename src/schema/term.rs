@@ -34,6 +34,11 @@ where B: AsRef<[u8]>;
 const TERM_METADATA_LENGTH: usize = 5;
 
 impl Term {
+    /// Returns the allocated capacity of the owned term buffer, in bytes.
+    pub(crate) fn heap_memory_usage(&self) -> usize {
+        self.0.capacity()
+    }
+
     /// Create a new Term with a buffer with a given capacity.
     pub fn with_capacity(capacity: usize) -> Term {
         let mut data = Vec::with_capacity(TERM_METADATA_LENGTH + capacity);
